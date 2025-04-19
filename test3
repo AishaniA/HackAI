@@ -14,6 +14,7 @@ from langchain.chat_models import ChatOpenAI
 from langchain.tools import Tool
 from langchain.agents import initialize_agent, AgentType
 import openai
+import re
 
 # === Set your OpenAI key ===
 os.environ["OPENAI_API_KEY"] = ""  # Replace with your key
@@ -29,21 +30,32 @@ os.makedirs(TABLES_DIR, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
 # === Extract text from PDF ===
-def extract_text_chunks(pdf_path, chunk_size=500):
+def extract_text_chunks(pdf_path):
     doc = pymupdf.open(pdf_path)
-    text_chunks = []
-    with open(TEXT_PATH, "w", encoding="utf-8") as f:
-        for page in doc:
-            text = page.get_text()
-            paragraphs = text.split("\n\n")
-            for para in paragraphs:
-                if len(para.strip()) > 0:
-                    for i in range(0, len(para), chunk_size):
-                        chunk = para[i:i + chunk_size]
-                        text_chunks.append(chunk)
-                        f.write(chunk + "\n\n")
+    chunks = []
+
+    for page_num, page in enumerate(doc):
+        blocks = page.get_text("blocks")  # returns (x0, y0, x1, y1, "text", block_no)
+        blocks.sort(key=lambda b: (b[1], b[0]))  # sort top-to-bottom
+
+        page_text = ""
+        for b in blocks:
+            text = b[4].strip()
+            if len(text) > 0:
+                page_text += text + "\n\n"  # double newline = paragraph split
+
+        # Clean page-level text
+        paragraphs = re.split(r'\n\s*\n', page_text)  # split on double newlines
+        for para in paragraphs:
+            cleaned = para.strip()
+            if len(cleaned) > 100:  # ignore junk
+                chunks.append({
+                    "page": page_num + 1,
+                    "text": cleaned
+                })
+
     doc.close()
-    return text_chunks
+    return chunks
 
 # === Extract tables and load into SQLite ===
 def extract_tables_to_db(pdf_path, db_path):
