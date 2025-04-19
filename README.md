@@ -1,1 +1,2 @@
 # HackAI
+pip install pdfplumber
