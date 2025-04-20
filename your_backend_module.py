@@ -24,7 +24,7 @@ from langchain.chat_models import ChatOpenAI
 
 
 # === Set your OpenAI key ===
-os.environ["OPENAI_API_KEY"] = secrets["OpenAI_key"]
+os.environ["OPENAI_API_KEY"] = st.secrets["OpenAI_key"]
 # === Setup paths ===
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Or hardcoded
 
