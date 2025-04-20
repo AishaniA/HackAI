@@ -13,7 +13,7 @@ from langchain.chains import RetrievalQA
 from langchain.chat_models import ChatOpenAI
 from langchain.tools import Tool
 from langchain.agents import initialize_agent, AgentType
-import openai
+from openai import OpenAI
 import re
 from unstructured.partition.pdf import partition_pdf
 import camelot
@@ -21,9 +21,10 @@ import camelot
 
 # === Set your OpenAI key ===
 os.environ["OPENAI_API_KEY"] = ""  # Replace with your key
-
 # === Setup paths ===
-OUTPUT_DIR = "/Users/succhaygadhar/Downloads/output"
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Or hardcoded
+
+OUTPUT_DIR = "/Users/succhaygadhar/Downloads/output1"
 TEXT_PATH = os.path.join(OUTPUT_DIR, "text_chunks.txt")
 TABLES_DIR = os.path.join(OUTPUT_DIR, "tables")
 IMAGES_DIR = os.path.join(OUTPUT_DIR, "images")
@@ -33,33 +34,38 @@ os.makedirs(TABLES_DIR, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
 # === Extract text from PDF ===
+# === Extract text from PDF ===
+
 def extract_text_chunks(pdf_path):
     doc = pymupdf.open(pdf_path)
     chunks = []
+    
+    with open(TEXT_PATH, "w", encoding="utf-8") as f:
+        for page_num, page in enumerate(doc):
+            blocks = page.get_text("dict")["blocks"]
+            lines = []
 
-    for page_num, page in enumerate(doc):
-        blocks = page.get_text("blocks")  # returns (x0, y0, x1, y1, "text", block_no)
-        blocks.sort(key=lambda b: (b[1], b[0]))  # sort top-to-bottom
+            for block in blocks:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        line_text = ""
+                        for span in line["spans"]:
+                            line_text += span["text"]
+                        if line_text.strip():
+                            lines.append(line_text.strip())
 
-        page_text = ""
-        for b in blocks:
-            text = b[4].strip()
-            if len(text) > 0:
-                page_text += text + "\n\n"  # double newline = paragraph split
+            full_page_text = "\n".join(lines)
+            paragraphs = re.split(r'\n\s*\n', full_page_text)
 
-        # Clean page-level text
-        paragraphs = re.split(r'\n\s*\n', page_text)  # split on double newlines
-        for para in paragraphs:
-            cleaned = para.strip()
-            if len(cleaned) > 100:  # ignore junk
-                chunks.append({
-                    "page": page_num + 1,
-                    "text": cleaned
-                })
+            for para in paragraphs:
+                para = para.strip()
+                if len(para) > 100:
+                    chunk = {"page": page_num + 1, "text": para}
+                    chunks.append(chunk)
+                    f.write(f"[Page {chunk['page']}]\n{chunk['text']}\n\n")
 
     doc.close()
     return chunks
-
 # === Extract tables and load into SQLite ===
 def extract_tables_to_db(pdf_path, db_path):
     conn = sqlite3.connect(db_path)
@@ -137,13 +143,20 @@ def parse_pdf(pdf_path):
 def setup_retriever(pdf_path):
     loader = PyMuPDFLoader(pdf_path)
     documents = loader.load()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,  # slightly bigger chunks
+        chunk_overlap=150  # more overlap = more context safety
+    )
     chunks = splitter.split_documents(documents)
     embeddings = OpenAIEmbeddings()
     vectorstore = FAISS.from_documents(chunks, embeddings)
     vectorstore.save_local("faiss_index")
-    retriever = vectorstore.as_retriever()
-    return RetrievalQA.from_chain_type(llm=ChatOpenAI(model="gpt-4"), retriever=retriever, return_source_documents=True)
+    retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 10})  # 🔥 higher recall
+    return RetrievalQA.from_chain_type(
+        llm=ChatOpenAI(model="gpt-4"),
+        retriever=retriever,
+        return_source_documents=True
+    )
 
 # === SQL Execution Tool ===
 def run_sql_query(query):
@@ -160,8 +173,12 @@ def setup_agent(qa_chain):
     doc_qa_tool = Tool(
     name="PDF_QA_Tool",
     func=lambda q: qa_chain.invoke({"query": q})["result"],
-    description="Use this to answer questions about the annual report PDF."
+    description=(
+        "Use this to answer **any questions about the uploaded PDF**. It searches the entire document thoroughly "
+        "and uses GPT-4 to reason across multiple sections. Ideal for summarizing, comparing sections, or finding detailed information."
     )
+    )
+
 
     sql_tool = Tool(
         name="SQL_Tool",
@@ -173,7 +190,7 @@ def setup_agent(qa_chain):
 
 # === Example Run ===
 if __name__ == "__main__":
-    pdf_path = "/Users/succhaygadhar/Downloads/ltimindtree_annual_report.pdf"  # Replace with your file
+    pdf_path = "/Users/succhaygadhar/Downloads/Untitled document (2).pdf"  # Replace with your file
     parse_pdf(pdf_path)
     qa_chain = setup_retriever(pdf_path)
     agent = setup_agent(qa_chain)
