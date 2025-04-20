@@ -14,21 +14,26 @@ from langchain.tools import Tool
 from langchain.agents import initialize_agent, AgentType
 from openai import OpenAI
 import re
+import matplotlib.pyplot as plt
 import json
 import openai
 import streamlit as st
 
+
+
+from unstructured.partition.pdf import partition_pdf
+import camelot
 from langchain.tools import Tool
 from langchain.agents import initialize_agent, AgentType
 from langchain.chat_models import ChatOpenAI
 
 
 # === Set your OpenAI key ===
-os.environ["OPENAI_API_KEY"] = st.secrets["OpenAI_key"]
+os.environ["OPENAI_API_KEY"] = ""
 # === Setup paths ===
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Or hardcoded
 
-OUTPUT_DIR = "/Users/succhaygadhar/Downloads/output6"
+OUTPUT_DIR = "/Users/succhaygadhar/Downloads/out4"
 TEXT_PATH = os.path.join(OUTPUT_DIR, "text_chunks.txt")
 TABLES_DIR = os.path.join(OUTPUT_DIR, "tables")
 IMAGES_DIR = os.path.join(OUTPUT_DIR, "images")
@@ -311,8 +316,66 @@ Your task is to return a JSON object with:
 
     return json.loads(response.choices[0].message.content)
 
+def generate_chart(query):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)['name'].tolist()
+
+        for table in tables:
+            df = pd.read_sql_query(f'SELECT * FROM "{table}"', conn)
+
+            plan = ask_ai_for_chart_plan_from_db(DB_PATH, query)
+            print("🧠 AI plan:", plan)
 
 
+            # Normalize AI column names to match df.columns
+            x = plan["x_column"]
+            y = plan.get("y_column")
+            
+
+            chart_type = plan["chart_type"]
+            agg_func = plan["aggregation"]
+            explanation = plan.get("explanation", "")
+            df[y] = pd.to_numeric(df[y], errors="coerce")
+
+                # Drop missing values after coercion
+
+
+
+            plt.figure(figsize=(10, 6))
+
+            if chart_type == "pie":
+                if y:
+                    grouped = df.groupby(x)[y].agg(agg_func).sort_values(ascending=False).head(10)
+                else:
+                    grouped = df[x].value_counts().head(10)
+                grouped.plot(kind="pie", autopct='%1.1f%%', startangle=90)
+                plt.ylabel("")
+            else:
+                grouped = df.groupby(x)[y].agg(agg_func).sort_values(ascending=False).head(20)
+                plot_args = {"kind": chart_type, "color": "skyblue", "linewidth": 2}
+                if chart_type == "line":
+                    plot_args["marker"] = "o"
+                grouped.plot(**plot_args)
+                plt.xlabel(x.replace("_", " ").title())
+                plt.ylabel(f"{agg_func.title()} of {y.replace('_', ' ').title()}" if y else "")
+                plt.xticks(rotation=45, ha='right')
+                plt.grid(True, linestyle="--", alpha=0.5)
+
+            title = f"{chart_type.title()} Chart of {y} by {x}" if y else f"{chart_type.title()} Chart of {x}"
+            plt.title(title)
+            plt.tight_layout()
+
+            chart_path = os.path.join(OUTPUT_DIR, f"{table}_{x}_vs_{y or 'count'}_{chart_type}.png")
+            plt.savefig(chart_path)
+            plt.show()
+            plt.close()
+
+            return f"📊 {explanation}\nChart saved to: {chart_path}"
+
+        return "⚠️ No tables found in the database."
+    except Exception as e:
+        return f"Chart Generation Error: {e}"
 # === Load image captions from file ===
 def load_image_captions():
     captions_path = os.path.join(OUTPUT_DIR, "image_captions.txt")
@@ -361,6 +424,7 @@ def setup_agent(qa_chain):
 
     chart_tool = Tool(
     name="Chart_Generator_Tool",
+    func=generate_chart,
     description=(
         "Use this tool to generate visual charts (bar, line, pie) from CSV or PDF tables. "
         "The tool automatically infers the best x and y columns from the query. "
