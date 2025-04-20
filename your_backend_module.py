@@ -20,7 +20,6 @@ import streamlit as st
 
 
 
-from unstructured.partition.pdf import partition_pdf
 import camelot
 from langchain.tools import Tool
 from langchain.agents import initialize_agent, AgentType
