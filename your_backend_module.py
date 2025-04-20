@@ -1,6 +1,5 @@
 import os
 import pymupdf  # PyMuPDF
-import pdfplumber
 import pandas as pd
 import sqlite3
 from PIL import Image
@@ -15,16 +14,26 @@ from langchain.tools import Tool
 from langchain.agents import initialize_agent, AgentType
 from openai import OpenAI
 import re
+import matplotlib.pyplot as plt
+import json
+import openai
+import streamlit as st
+
+
+
 from unstructured.partition.pdf import partition_pdf
 import camelot
+from langchain.tools import Tool
+from langchain.agents import initialize_agent, AgentType
+from langchain.chat_models import ChatOpenAI
 
 
 # === Set your OpenAI key ===
-os.environ["OPENAI_API_KEY"] = ""  # Replace with your key
+os.environ["OPENAI_API_KEY"] = st.secrets["OpenAI_key"]
 # === Setup paths ===
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Or hardcoded
 
-OUTPUT_DIR = "/Users/succhaygadhar/Downloads/output2"
+OUTPUT_DIR = "/Users/succhaygadhar/Downloads/output6"
 TEXT_PATH = os.path.join(OUTPUT_DIR, "text_chunks.txt")
 TABLES_DIR = os.path.join(OUTPUT_DIR, "tables")
 IMAGES_DIR = os.path.join(OUTPUT_DIR, "images")
@@ -108,6 +117,29 @@ def extract_tables_to_db(pdf_path, db_path):
     conn.close()
     return tables
 
+def load_csv_to_db(csv_path, db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        df = pd.read_csv(csv_path)
+
+        # Ensure valid column names
+        df.columns = [
+            col if col and str(col).strip() else f"col_{i+1}"
+            for i, col in enumerate(df.columns)
+        ]
+        df.columns = make_unique_columns(df.columns)
+
+        table_name = os.path.splitext(os.path.basename(csv_path))[0]
+        df.to_sql(table_name, conn, if_exists="replace", index=False)
+
+        print(f"✅ CSV loaded into table: {table_name}")
+    except Exception as e:
+        print(f"❌ Failed to load CSV: {e}")
+    finally:
+        conn.commit()
+        conn.close()
+
+
 # Helper: ensures valid + unique column names
 def make_unique_columns(columns):
     seen = {}
@@ -138,6 +170,49 @@ def extract_images(pdf_path):
     doc.close()
     return img_count
 
+from transformers import BlipProcessor, BlipForConditionalGeneration
+import torch
+
+# === BLIP caption generator setup (load once) ===
+def setup_blip_model():
+    processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+    model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+    return processor, model
+
+# === Generate captions for extracted images ===
+def caption_images(image_dir):
+    processor, model = setup_blip_model()
+    captions = {}
+    all_caption_lines = []
+
+    for filename in os.listdir(image_dir):
+        if filename.endswith(".png"):
+            image_path = os.path.join(image_dir, filename)
+            image = Image.open(image_path).convert("RGB")
+
+            inputs = processor(images=image, return_tensors="pt")
+            with torch.no_grad():
+                out = model.generate(**inputs)
+                caption = processor.decode(out[0], skip_special_tokens=True)
+
+            captions[filename] = caption
+            print(f"🖼 {filename} → 📝 {caption}")
+
+            # Save individual caption file (optional)
+            with open(os.path.join(image_dir, f"{filename}.txt"), "w") as f:
+                f.write(caption)
+
+            # Add to list for combined text file
+            all_caption_lines.append(f"{filename}:\n{caption}\n")
+
+    # Save all captions to one text file
+    all_caption_path = os.path.join(OUTPUT_DIR, "image_captions.txt")
+    with open(all_caption_path, "w", encoding="utf-8") as f:
+        f.writelines(all_caption_lines)
+
+    return captions
+
+
 # === Parse PDF and prepare everything ===
 def parse_pdf(pdf_path):
     print("Extracting text...")
@@ -149,12 +224,17 @@ def parse_pdf(pdf_path):
     print("Extracting images...")
     num_images = extract_images(pdf_path)
 
+    print("Generating image captions...")
+    image_captions = caption_images(IMAGES_DIR)
+
     return {
         "text_chunks": text_chunks,
         "tables": tables,
         "num_images": num_images,
+        "image_captions": image_captions,
         "db_path": DB_PATH
     }
+
 
 # === Setup LangChain Retrieval QA ===
 def setup_retriever(pdf_path):
@@ -186,35 +266,207 @@ def run_sql_query(query):
         return f"SQL Error: {e}"
 
 # === Main Agent Setup ===
-def setup_agent(qa_chain):
-    doc_qa_tool = Tool(
-    name="PDF_QA_Tool",
-    func=lambda q: qa_chain.invoke({"query": q})["result"],
-    description=(
-        "Use this to answer **any questions about the uploaded PDF**. It searches the entire document thoroughly "
-        "and uses GPT-4 to reason across multiple sections. Ideal for summarizing, comparing sections, or finding detailed information."
-    )
+import matplotlib.pyplot as plt
+import pandas as pd
+import sqlite3
+import os
+import re
+
+def ask_ai_for_chart_plan_from_db(db_path, query):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Get all table names
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [row[0] for row in cursor.fetchall()]
+
+    schema = {}
+
+    for table in tables:
+        cursor.execute(f"PRAGMA table_info('{table}')")
+        columns = [col[1] for col in cursor.fetchall()]
+        cursor.execute(f"SELECT * FROM '{table}' LIMIT 5")
+        rows = cursor.fetchall()
+        schema[table] = {
+            "columns": columns,
+            "sample": [dict(zip(columns, row)) for row in rows]
+        }
+
+    prompt = f"""
+You are a data analysis assistant.
+
+A user asks: "{query}"
+
+Here is the schema and sample data from the SQLite database:
+{json.dumps(schema, indent=2)}
+
+Your task is to return a JSON object with:
+- x_column: (string) the x-axis column
+- y_column: (string) the y-axis column (can be null for pie charts)
+- chart_type: (string) "bar", "line", or "pie"
+- aggregation: (string) "mean", "sum", or "count"
+- explanation: (string) why you chose these columns
+"""
+
+    response = openai.chat.completions.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
     )
 
+    return json.loads(response.choices[0].message.content)
+
+def generate_chart(query):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)['name'].tolist()
+
+        for table in tables:
+            df = pd.read_sql_query(f'SELECT * FROM "{table}"', conn)
+
+            plan = ask_ai_for_chart_plan_from_db(DB_PATH, query)
+            print("🧠 AI plan:", plan)
+
+
+            # Normalize AI column names to match df.columns
+            x = plan["x_column"]
+            y = plan.get("y_column")
+            
+
+            chart_type = plan["chart_type"]
+            agg_func = plan["aggregation"]
+            explanation = plan.get("explanation", "")
+            df[y] = pd.to_numeric(df[y], errors="coerce")
+
+                # Drop missing values after coercion
+
+
+
+            plt.figure(figsize=(10, 6))
+
+            if chart_type == "pie":
+                if y:
+                    grouped = df.groupby(x)[y].agg(agg_func).sort_values(ascending=False).head(10)
+                else:
+                    grouped = df[x].value_counts().head(10)
+                grouped.plot(kind="pie", autopct='%1.1f%%', startangle=90)
+                plt.ylabel("")
+            else:
+                grouped = df.groupby(x)[y].agg(agg_func).sort_values(ascending=False).head(20)
+                plot_args = {"kind": chart_type, "color": "skyblue", "linewidth": 2}
+                if chart_type == "line":
+                    plot_args["marker"] = "o"
+                grouped.plot(**plot_args)
+                plt.xlabel(x.replace("_", " ").title())
+                plt.ylabel(f"{agg_func.title()} of {y.replace('_', ' ').title()}" if y else "")
+                plt.xticks(rotation=45, ha='right')
+                plt.grid(True, linestyle="--", alpha=0.5)
+
+            title = f"{chart_type.title()} Chart of {y} by {x}" if y else f"{chart_type.title()} Chart of {x}"
+            plt.title(title)
+            plt.tight_layout()
+
+            chart_path = os.path.join(OUTPUT_DIR, f"{table}_{x}_vs_{y or 'count'}_{chart_type}.png")
+            plt.savefig(chart_path)
+            plt.show()
+            plt.close()
+
+            return f"📊 {explanation}\nChart saved to: {chart_path}"
+
+        return "⚠️ No tables found in the database."
+    except Exception as e:
+        return f"Chart Generation Error: {e}"
+# === Load image captions from file ===
+def load_image_captions():
+    captions_path = os.path.join(OUTPUT_DIR, "image_captions.txt")
+    if not os.path.exists(captions_path):
+        return "No image captions were found."
+    with open(captions_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+def image_caption_tool_fn(query):
+    captions = load_image_captions()
+    return f"""Use the following image captions to answer the question.
+
+Image Captions:
+{captions}
+
+Question: {query}
+"""
+
+# === Setup full LangChain agent ===
+def setup_agent(qa_chain):
+    doc_qa_tool = Tool(
+        name="PDF_QA_Tool",
+        func=lambda q: qa_chain.invoke({"query": q})["result"] if qa_chain else "No QA retriever available.",
+        description=(
+            "Use this to answer questions about the uploaded PDF. "
+            "It searches the full document and uses GPT-4 to reason across multiple sections."
+        )
+    )
 
     sql_tool = Tool(
         name="SQL_Tool",
         func=run_sql_query,
-        description="Useful for querying tabular data from the financials database using SQL."
+        description=(
+            "Use this tool to query structured tabular data (from PDF tables or CSV) using SQLite syntax."
+        )
     )
-    llm = ChatOpenAI(temperature=0, model="gpt-4")
-    return initialize_agent(tools=[doc_qa_tool, sql_tool], llm=llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
 
+    image_tool = Tool(
+        name="Image_Caption_Tool",
+        func=image_caption_tool_fn,
+        description=(
+            "Use this to answer questions about images or charts in the PDF. "
+            "It uses BLIP-generated captions. Ask things like 'What does the chart on page 5 show?'."
+        )
+    )
+
+    chart_tool = Tool(
+    name="Chart_Generator_Tool",
+    func=generate_chart,
+    description=(
+        "Use this tool to generate visual charts (bar, line, pie) from CSV or PDF tables. "
+        "The tool automatically infers the best x and y columns from the query. "
+        "Ask things like: 'Show average order value by month', 'Line chart of profit by year', or 'Pie chart of category distribution'."
+        )
+    )
+
+
+    llm = ChatOpenAI(temperature=0, model="gpt-4")
+
+    return initialize_agent(
+        tools=[doc_qa_tool, sql_tool, image_tool, chart_tool],
+        llm=llm,
+        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+        verbose=True
+    )
 # === Example Run ===
 if __name__ == "__main__":
-    pdf_path = "/Users/succhaygadhar/Downloads/ltimindtree_annual_report.pdf"  # Replace with your file
-    parse_pdf(pdf_path)
-    qa_chain = setup_retriever(pdf_path)
+    input_path = input("📄 Enter path to PDF or CSV file: ").strip()
+
+    if input_path.lower().endswith(".pdf"):
+        parse_pdf(input_path)
+        qa_chain = setup_retriever(input_path)
+    elif input_path.lower().endswith(".csv"):
+        load_csv_to_db(input_path, DB_PATH)
+        qa_chain = None  # No retriever needed for CSV-only mode
+    else:
+        print("❌ Unsupported file type. Please provide a .pdf or .csv file.")
+        exit()
+
     agent = setup_agent(qa_chain)
 
     while True:
         query = input("\n💬 Ask a question (or type 'exit'): ")
         if query.lower() == "exit":
             break
-        response = agent.run(query)
+
+        # 🔍 Basic keyword trigger to directly call the chart generator
+        if "chart" in query.lower() or "graph" in query.lower() or "plot" in query.lower():
+            print("\n📊 Generating chart...")
+            response = generate_chart(query)
+        else:
+            response = agent.run(query)
+
         print("\n🧠 Response:", response)
