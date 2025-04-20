@@ -24,7 +24,7 @@ os.environ["OPENAI_API_KEY"] = ""  # Replace with your key
 # === Setup paths ===
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Or hardcoded
 
-OUTPUT_DIR = "/Users/succhaygadhar/Downloads/output1"
+OUTPUT_DIR = "/Users/succhaygadhar/Downloads/output2"
 TEXT_PATH = os.path.join(OUTPUT_DIR, "text_chunks.txt")
 TABLES_DIR = os.path.join(OUTPUT_DIR, "tables")
 IMAGES_DIR = os.path.join(OUTPUT_DIR, "images")
@@ -67,43 +67,60 @@ def extract_text_chunks(pdf_path):
     doc.close()
     return chunks
 # === Extract tables and load into SQLite ===
+import pymupdf  # PyMuPDF
+
 def extract_tables_to_db(pdf_path, db_path):
+    import sqlite3
     conn = sqlite3.connect(db_path)
     tables = []
     table_counter = 1
 
-    print("🔍 Scanning for tables with Camelot...")
+    doc = pymupdf.open(pdf_path)
 
-    # Try both lattice (with lines) and stream (without lines)
-    all_tables = camelot.read_pdf(pdf_path, pages='all', flavor='stream')
-
-    print(f"✅ Found {all_tables.n} tables")
-
-    for i, table in enumerate(all_tables):
-        try:
-            df = table.df
-
-            # First row might be header
-            if df.shape[0] < 2:
-                continue
-
-            df.columns = [f"col_{j}" for j in range(df.shape[1])] if df.columns.isnull().any() else df.iloc[0]
-            df = df[1:] if df.columns.equals(df.iloc[0]) else df
-
-            table_name = f"table_{table_counter}"
-            df.to_sql(table_name, conn, if_exists="replace", index=False)
-            df.to_csv(os.path.join(TABLES_DIR, f"{table_name}.csv"), index=False)
-            tables.append((table_name, df))
-            table_counter += 1
-
-        except Exception as e:
-            print(f"⚠️ Error parsing table {i}: {e}")
+    for page_num, page in enumerate(doc):
+        tabs = page.find_tables()
+        if not tabs or not tabs.tables:
             continue
+
+        for tnum, tab in enumerate(tabs.tables):
+            try:
+                df = tab.to_pandas()
+
+                # Fallback header fix
+                df.columns = [
+                    col if col and str(col).strip() else f"col_{i+1}"
+                    for i, col in enumerate(df.columns)
+                ]
+                df.columns = make_unique_columns(df.columns)
+
+                table_name = f"table_page{page_num+1}_{table_counter}"
+                csv_path = os.path.join(TABLES_DIR, f"{table_name}.csv")
+                df.to_csv(csv_path, index=False)
+                df.to_sql(table_name, conn, if_exists="replace", index=False)
+
+                tables.append((table_name, df))
+                print(f"✅ Extracted (MuPDF) table on page {page_num + 1} → {table_name}")
+                table_counter += 1
+            except Exception as e:
+                print(f"❌ Failed to extract table on page {page_num+1}: {e}")
 
     conn.commit()
     conn.close()
     return tables
 
+# Helper: ensures valid + unique column names
+def make_unique_columns(columns):
+    seen = {}
+    unique = []
+    for col in columns:
+        col = col if col and str(col).strip() else "column"
+        if col in seen:
+            seen[col] += 1
+            unique.append(f"{col}_{seen[col]}")
+        else:
+            seen[col] = 0
+            unique.append(col)
+    return unique
 
 # === Extract images ===
 def extract_images(pdf_path):
@@ -190,7 +207,7 @@ def setup_agent(qa_chain):
 
 # === Example Run ===
 if __name__ == "__main__":
-    pdf_path = "/Users/succhaygadhar/Downloads/Untitled document (2).pdf"  # Replace with your file
+    pdf_path = "/Users/succhaygadhar/Downloads/ltimindtree_annual_report.pdf"  # Replace with your file
     parse_pdf(pdf_path)
     qa_chain = setup_retriever(pdf_path)
     agent = setup_agent(qa_chain)
