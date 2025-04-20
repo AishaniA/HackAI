@@ -22,7 +22,8 @@ We used a combination of tools and frameworks:
 1. Download project and open root project directory
 2. Go to backend.py and change output directory to local dessired location
 3. Substitute OPEN AI API Key in for place holder
-4. In terminal under project root folder run, " streamlit run app.py "
+4. Install dependencies as needed
+5. In terminal under project root folder run, " streamlit run app.py "
 
 ## Challenges we ran into
 Reading tables from PDFs was especially difficult due to inconsistent layouts. Many tools didn’t return usable results, which cost us a lot of time. We also had limitations with styling the frontend since Streamlit is lightweight and simple by design.
