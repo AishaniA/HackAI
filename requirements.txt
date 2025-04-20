@@ -1,7 +1,7 @@
 pymupdf
 langchain-community
 openai
-matplotlib
+matplotlib as plt
 pandas
 json
 streamlit
