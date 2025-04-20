@@ -14,7 +14,6 @@ from langchain.tools import Tool
 from langchain.agents import initialize_agent, AgentType
 from openai import OpenAI
 import re
-import matplotlib.pyplot as plt
 import json
 import openai
 import streamlit as st
