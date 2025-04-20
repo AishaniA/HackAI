@@ -18,9 +18,6 @@ import json
 import openai
 import streamlit as st
 
-
-
-import camelot
 from langchain.tools import Tool
 from langchain.agents import initialize_agent, AgentType
 from langchain.chat_models import ChatOpenAI
